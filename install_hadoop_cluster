@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+
+# Create hadoop servers from base ubuvm
+# Assumes the following:
+#   - a base Ubuntu Server 14.04.1 LTS exists with the name BASE_SERVER_NAME
+#   - Server has openssh-server installed
+#   - host-only and NAT networks setup
+#   - BASE_SERVER_NAME is not running
+#   - your user has a ssh key created as id_rsa.pub
+#   - BASE_SERVER_NAME is in your hosts file with the IP address assigned
+#   - New nodes will have IP addresses 192.68.56.21 to 25
+
+BASE_SERVER_NAME="baseubusrvvm"
+
+function die() {
+    # $1 - the exit code
+    # $2 $... - the message string
+
+    retcode=$1
+    shift
+    printf >&2 "%s\n" "$@"
+    exit $retcode
+}
+
+function ssh_wait() {
+    host=$1
+    wait_for=$2
+    while [ "`nc -z -w1 ${host} 22; echo $?`" != "${wait_for}" ]; do
+        echo -n "."
+        sleep 1
+    done
+    echo ""
+}
+
+function start_vm() {
+    echo "Starting $1..."
+    vboxmanage startvm $1 --type=headless || die 1 "failed to start $1"
+    ssh_wait 192.168.56.$2 0 # 0 is success
+}
+
+function shutdown_and_take_snapshot() {
+    echo "Waiting for shutdown to take a snapshot..."
+    ssh_wait 192.168.56.$2 1 # 1 is timeout
+
+    echo "Taking snapshot $3..."
+    vboxmanage snapshot $1 take "$3" || die 1 "failed to take $3 snapshot"
+    sleep 1
+}
+
+SUDOPASSWD=""
+PASSCH="check"
+while [ "$SUDOPASSWD" != "$PASSCH" ]; do
+    echo -n "Enter sudo password: "
+    read -s SUDOPASSWD
+    echo
+
+    echo -n "Re-enter password..: "
+    read -s PASSCH
+    echo
+done
+
+VMS="hadoopnamenode
+hadoopdatanode1
+hadoopdatanode2
+hadoopdatanode3
+hadoopsecondarynamenode"
+
+VM_IPS="192.168.56.21
+192.168.56.22
+192.168.56.23
+192.168.56.24
+192.168.56.25"
+
+cat << EOF > /tmp/hdfs-site.xml
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<configuration>
+    <property>
+        <name>dfs.replication</name>
+        <value>3</value>
+    </property>
+    <property>
+        <name>dfs.namenode.secondary.http-address</name>
+        <value>hadoopsecondarynamenode:50090</value>
+    </property>
+</configuration>
+EOF
+
+cat << EOF > /tmp/additional_hosts
+192.168.56.21   hadoopnamenode
+192.168.56.22   hadoopdatanode1
+192.168.56.23   hadoopdatanode2
+192.168.56.24   hadoopdatanode3
+192.168.56.25   hadoopsecondarynamenode
+EOF
+
+for vm in $VMS
+do
+    vboxmanage snapshot $vm restore "psuedo-distributed mode installed"
+    vboxmanage startvm $vm --type=headless || die 1 "failed to start $vm"
+    ssh_wait $vm 0 # wait for ssh to come back
+
+    ssh-copy-id -i ~/.ssh/id_rsa.pub hduser@$vm || die 1 "failed to copy ssh key to $vm"
+
+    scp -q /tmp/hdfs-site.xml hduser@$vm:/opt/hadoop/etc/hadoop
+
+    CMD="sed -i 's/localhost/hadoopnamenode/g' /opt/hadoop/etc/hadoop/core-site.xml &&
+    sed -i 's/localhost/hadoopnamenode/g' /opt/hadoop/etc/hadoop/yarn-site.xml"
+    ssh hduser@$vm $CMD || die 1 "failed to change core-site or yarn-site config on $vm"
+
+    CMD="rm -rf /opt/hadoop/tmp/*"
+    ssh hduser@$vm $CMD || die 1 "failed to remove files from tmp directory on $vm"
+
+    scp -q /tmp/additional_hosts $vm:/tmp
+    CMD="echo $SUDOPASSWD | sudo -S sh -c 'cat /tmp/additional_hosts >> /etc/hosts'"
+    ssh $vm $CMD || die 1 "failed to add new hosts to /etc/hosts on $vm"
+
+    CMD="echo $SUDOPASSWD | sudo -S sed -i 's/127.0.1.1/# 127.0.1.1/g' /etc/hosts"
+    ssh $vm $CMD || die 1 "failed to remove 127.0.1.1 entry from $vm"
+
+    echo
+done
+
+CMD="echo $SUDOPASSWD | sudo -S sh -c 'echo \"hadoopdatanode1\" > /opt/hadoop/etc/hadoop/slaves &&
+echo \"hadoopdatanode2\" >> /opt/hadoop/etc/hadoop/slaves &&
+echo \"hadoopdatanode3\" >> /opt/hadoop/etc/hadoop/slaves'"
+ssh -t hadoopnamenode $CMD || die 1 "failed to setup slaves on namenode"
+
+for vm in $VMS
+do
+    for machine in $VMS
+    do
+        echo "Copying ssh keys from $vm to $machine..."
+        CMD="scp -q -o StrictHostKeyChecking=no -r ~/.ssh $machine:~/ && ssh -o StrictHostKeyChecking=no $machine 'exit'"
+        ssh -t hduser@$vm $CMD || die 1 "failed to copy ssh keys to $machine on $vm"
+    done
+done
+
+rm /tmp/hdfs-site.xml /tmp/additional_hosts
+
+CMD="export JAVA_HOME=/usr/lib/jvm/java-7-openjdk-amd64 &&
+export HADOOP_HOME=/opt/hadoop &&
+/opt/hadoop/bin/hdfs namenode -format && 
+/opt/hadoop/sbin/start-dfs.sh && 
+/opt/hadoop/sbin/start-yarn.sh"
+ssh hduser@hadoopnamenode $CMD || die 1 "failed to format namenode and start hadoop"

@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+
+# Script to install Hadoop per this tutorial:
+#   http://www.michael-noll.com/tutorials/running-hadoop-on-ubuntu-linux-single-node-cluster/
+#
+# ccarey - 2013-04-21
+
+die() {
+    # $1 - the exit code
+    # $2 $... - the message string
+
+    retcode=$1
+    shift
+    printf >&2 "%s\n" "$@"
+    exit $retcode
+}
+
+runCommand() {
+    user=$1
+    command=$2
+
+    echo -n "${user} "
+    su - ${user} -c "export JAVA_HOME=${JAVA_HOME}; ${HADOOP_HOME}/${command}" || die 1 "cannot continue ... check error messages"
+}
+
+removeConfigNode() {
+    file=$1
+    sudo sed -i "s/<configuration>//g" ${file} || die 1 "cannot continue ... check error messages"
+    sudo sed -i "s/<\/configuration>//g" ${file} || die 1 "cannot continue ... check error messages"
+}
+
+HADOOP_MIRROR="http://mirror.cogentco.com/pub/apache/hadoop/common"
+[[ -z "$1" ]] || HADOOP_MIRROR="$1"
+
+echo $HADOOP_MIRROR
+
+HADOOP_VERSION="2.6.0"
+ORIG_DIR="`pwd`"
+INSTALL_ROOT="/opt"
+
+JAVA_HOME=/usr/lib/jvm/java-7-openjdk-amd64
+HADOOP_HOME=${INSTALL_ROOT}/hadoop
+
+# Pre-requisites
+
+# Check for java... install if not there
+
+type java >/dev/null 2>&1 || sudo apt-get -y install openjdk-7-jdk
+
+# Add dedicated Hadoop system user
+
+sudo addgroup hadoop
+sudo adduser --ingroup hadoop hduser
+
+# Configure SSH
+
+echo -n "hduser "
+su - hduser -c "ssh-keygen -t rsa -P '' && cat .ssh/id_rsa.pub >> .ssh/authorized_keys && ssh -o StrictHostKeyChecking=no localhost 'exit'" || die 1 "cannot continue from configure of SSH"
+
+# Get Hadoop
+
+cd /tmp
+
+[[ -d hadoop-${HADOOP_VERSION} ]] || {
+    [[ -f hadoop-${HADOOP_VERSION}.tar.gz ]] || {
+        wget ${HADOOP_MIRROR}/hadoop-${HADOOP_VERSION}/hadoop-${HADOOP_VERSION}.tar.gz || die 1 "download of hadoop failed ... cannot continue"
+    }
+}
+
+# Extract/Install Hadoop
+
+cd ${INSTALL_ROOT}
+sudo tar xfz /tmp/hadoop-${HADOOP_VERSION}.tar.gz
+sudo chown -R hduser:hadoop hadoop-${HADOOP_VERSION}
+sudo ln -s hadoop-${HADOOP_VERSION} hadoop
+
+# Update $HOME/.bashrc
+
+sudo chmod 666 /home/hduser/.bashrc
+cat << EOF >> /home/hduser/.bashrc
+# Set Hadoop-related environment variables
+export HADOOP_HOME=${HADOOP_HOME}
+
+# Set JAVA_HOME (we will also configure JAVA_HOME directly for Hadoop later on)
+export JAVA_HOME=${JAVA_HOME}
+
+# Some convenient aliases and functions for running Hadoop-related commands
+unalias hdpfs &> /dev/null
+alias hdpfs="hadoop fs"
+unalias hdpls &> /dev/null
+alias hdpls="hdpfs -ls"
+
+# If you have LZO compression enabled in your Hadoop cluster and
+# compress job outputs with LZOP (not covered in this tutorial):
+# Conveniently inspect an LZOP compressed file from the command
+# line; run via:
+#
+# $ lzohead /hdfs/path/to/lzop/compressed/file.lzo
+#
+# Requires installed 'lzop' command.
+#
+lzohead () {
+    hadoop fs -cat \$1 | lzop -dc | head -1000 | less
+}
+
+# Add Hadoop bin/ directory to PATH
+export PATH=\$PATH:\$HADOOP_HOME/bin:\$HADOOP_HOME/sbin
+EOF
+
+sudo chmod 644 /home/hduser/.bashrc
+
+# Configuration
+
+# hadoop-env.sh
+
+sudo chmod 666 ${INSTALL_ROOT}/hadoop/etc/hadoop/hadoop-env.sh || die 1 "cannot continue ... check error messages"
+search="\${JAVA_HOME}"
+replace=`echo ${JAVA_HOME} |sed 's/\//\\\\\//g'`
+sudo sed -i "s/${search}/${replace}/g" ${INSTALL_ROOT}/hadoop/etc/hadoop/hadoop-env.sh || die 1 "cannot continue ... check error messages"
+sudo sed -i "s/HADOOP_OPTS=-Djava\.net\.preferIPv4Stack=true/HADOOP_OPTS=-Djava\.net\.preferIPv4Stack=true -Djava\.library\.path=\$HADOOP_PREFIX\/lib/g" ${INSTALL_ROOT}/hadoop/etc/hadoop/hadoop-env.sh || die 1 "cannot continue ... check error messages"
+sudo chmod 664 ${INSTALL_ROOT}/hadoop/etc/hadoop/hadoop-env.sh || die 1 "cannot continue ... check error messages"
+
+# yarn-env.sh
+
+sudo chmod 666 ${INSTALL_ROOT}/hadoop/etc/hadoop/yarn-env.sh || die 1 "cannot continue ... check error messages"
+sudo cat << EOF >> ${INSTALL_ROOT}/hadoop/etc/hadoop/yarn-env.sh
+export HADOOP_CONF_LIB_NATIVE_DIR=\${HADOOP_PREFIX}-"/lib/native"}
+export HADOOP_OPTS="-Djava.library.path=\$HADOOP_PREFIX/lib"
+EOF
+sudo chmod 664 ${INSTALL_ROOT}/hadoop/etc/hadoop/yarn-env.sh || die 1 "cannot continue ... check error messages"
+
+# etc/hadoop/*-site.xml
+
+sudo mkdir -p ${INSTALL_ROOT}/hadoop/tmp || die 1 "cannot continue ... check error messages"
+sudo chown hduser:hadoop ${INSTALL_ROOT}/hadoop/tmp || die 1 "cannot continue ... check error messages"
+sudo chmod 750 ${INSTALL_ROOT}/hadoop/tmp || die 1 "cannot continue ... check error messages"
+
+removeConfigNode ${INSTALL_ROOT}/hadoop/etc/hadoop/core-site.xml
+
+sudo chmod 666 ${INSTALL_ROOT}/hadoop/etc/hadoop/core-site.xml || die 1 "cannot continue ... check error messages"
+sudo cat << EOF >> ${INSTALL_ROOT}/hadoop/etc/hadoop/core-site.xml
+<configuration>
+    <property>
+        <name>hadoop.tmp.dir</name>
+        <value>${INSTALL_ROOT}/hadoop/tmp</value>
+        <description>A base for other temporary directories.</description>
+    </property>
+
+    <property>
+        <name>fs.default.name</name>
+        <value>hdfs://localhost:9000</value>
+        <description>The name of the default file system.  A URI whose
+        scheme and authority determine the FileSystem implementation.  The
+        uri's scheme determines the config property (fs.SCHEME.impl) naming
+        the FileSystem implementation class.  The uri's authority is used to
+        determine the host, port, etc. for a filesystem.</description>
+    </property>
+</configuration>
+EOF
+sudo chmod 664 ${INSTALL_ROOT}/hadoop/etc/hadoop/core-site.xml || die 1 "cannot continue ... check error messages"
+
+sudo cp ${INSTALL_ROOT}/hadoop/etc/hadoop/mapred-site.xml.template ${INSTALL_ROOT}/hadoop/etc/hadoop/mapred-site.xml
+removeConfigNode ${INSTALL_ROOT}/hadoop/etc/hadoop/mapred-site.xml
+
+sudo chmod 666 ${INSTALL_ROOT}/hadoop/etc/hadoop/mapred-site.xml || die 1 "cannot continue ... check error messages"
+sudo cat << EOF >> ${INSTALL_ROOT}/hadoop/etc/hadoop/mapred-site.xml
+<configuration>
+    <property>
+        <name>mapreduce.framework.name</name>
+        <value>yarn</value>
+    </property>
+</configuration>
+EOF
+sudo chmod 664 ${INSTALL_ROOT}/hadoop/etc/hadoop/mapred-site.xml || die 1 "cannot continue ... check error messages"
+
+removeConfigNode ${INSTALL_ROOT}/hadoop/etc/hadoop/hdfs-site.xml
+
+sudo chmod 666 ${INSTALL_ROOT}/hadoop/etc/hadoop/hdfs-site.xml || die 1 "cannot continue ... check error messages"
+sudo cat << EOF >> ${INSTALL_ROOT}/hadoop/etc/hadoop/hdfs-site.xml
+<configuration>
+    <property>
+        <name>dfs.replication</name>
+        <!-- <value>1</value> -->
+        <value>3</value>
+        <description>Default block replication.
+        The actual number of replications can be specified when the file is created.
+        The default is used if replication is not specified in create time.
+        </description>
+    </property>
+</configuration>
+EOF
+sudo chmod 664 ${INSTALL_ROOT}/hadoop/etc/hadoop/hdfs-site.xml || die 1 "cannot continue ... check error messages"
+
+removeConfigNode ${INSTALL_ROOT}/hadoop/etc/hadoop/yarn-site.xml
+
+sudo chmod 666 ${INSTALL_ROOT}/hadoop/etc/hadoop/yarn-site.xml || die 1 "cannot continue ... check error messages"
+sudo cat << EOF >> ${INSTALL_ROOT}/hadoop/etc/hadoop/yarn-site.xml
+<configuration>
+    <property>
+        <name>yarn.nodemanager.aux-services</name>
+        <value>mapreduce_shuffle</value>
+    </property>
+    <property>
+        <name>yarn.nodemanager.aux-services.mapreduce_shuffle.class</name>
+        <value>org.apache.hadoop.mapred.ShuffleHandler</value>
+    </property>
+    <property>
+        <name>yarn.resourcemanager.resource-tracker.address</name>
+        <value>localhost:8025</value>
+    </property>
+    <property>
+        <name>yarn.resourcemanager.scheduler.address</name>
+        <value>localhost:8030</value>
+    </property>
+    <property>
+        <name>yarn.resourcemanager.address</name>
+        <value>localhost:8050</value>
+    </property>
+</configuration>
+EOF
+sudo chmod 664 ${INSTALL_ROOT}/hadoop/etc/hadoop/yarn-site.xml || die 1 "cannot continue ... check error messages"
+
+# Format HDFS filesystem
+runCommand hduser "bin/hdfs namenode -format" || die 1 "cannot continue ... check error messages"
+
+# Start DFS and yarn
+runCommand hduser "sbin/start-dfs.sh"
+
+runCommand hduser "sbin/start-yarn.sh"
